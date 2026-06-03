@@ -80,6 +80,32 @@ def get_dataloaders(
         remove=('headers', 'footers', 'quotes'),
         random_state=random_state,
     )
+
+    print("Saving raw data locally...")
+
+    # Create dictionaries containing the text and their corresponding labels
+    train_data_dict = {
+        "text": train_raw.data,
+        "labels": train_raw.target.tolist(),
+        "target_names": train_raw.target_names
+    }
+
+    test_data_dict = {
+        "text": test_raw.data,
+        "labels": test_raw.target.tolist(),
+        "target_names": test_raw.target_names
+    }
+
+    # Write them to JSON files
+    with open("train_raw_data.json", "w", encoding="utf-8") as f:
+        json.dump(train_data_dict, f, indent=2) 
+
+    with open("test_raw_data.json", "w", encoding="utf-8") as f:
+        json.dump(test_data_dict, f, indent=2)
+
+    print("  Saved to train_raw_data.json and test_raw_data.json")
+    # END NEW CODE
+
     print(f"  Train docs : {len(train_raw.data)}")
     print(f"  Test docs  : {len(test_raw.data)}")
 
