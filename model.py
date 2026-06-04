@@ -64,17 +64,22 @@ class Decoder(nn.Module):
     Output : recon  (batch_size, vocab_size) — log prob over vocabulary
     """
 
-    def __init__(self, n_topics, vocab_size):
+    def __init__(self, n_topics, vocab_size, model_type="prodLDA"):
         super().__init__()
-
+        self.model_type = model_type
         # Beta matrix: each row is a topic's word distribution
         # No bias — keeps the interpretation clean (pure topic-word weights)
         self.fc      = nn.Linear(n_topics, vocab_size, bias=False)
         self.bn      = nn.BatchNorm1d(vocab_size)
 
     def forward(self, theta):
-        # theta: softmax output, sums to 1 per document
-        recon = F.log_softmax(self.bn(self.fc(theta)), dim=1)
+        if self.model_type == 'LDA':
+            # Normalize beta per topic first, then mix
+            beta  = F.softmax(self.fc.weight, dim=0)  # (vocab_size, n_topics)
+            recon = F.log_softmax(self.bn(theta @ beta.T), dim=1)
+        else:
+            # ProdLDA: mix in logit space, softmax after
+            recon = F.log_softmax(self.bn(self.fc(theta)), dim=1)
         return recon
 
 
@@ -102,6 +107,7 @@ class AVITM(nn.Module):
         n_topics=50,
         hidden_size=100,
         dropout=0.2,
+        model_type="prodLDA"
     ):
         super().__init__()
 
@@ -109,7 +115,7 @@ class AVITM(nn.Module):
         self.vocab_size = vocab_size
 
         self.encoder = Encoder(vocab_size, n_topics, hidden_size, dropout)
-        self.decoder = Decoder(n_topics, vocab_size)
+        self.decoder = Decoder(n_topics, vocab_size, model_type)
 
         # Prior: N(0, I) in the Laplace approximation space
         # (approximates a symmetric Dirichlet prior)
@@ -224,10 +230,14 @@ def compute_loss(recon, x, mu, log_var):
 
     # Full KL: KL(N(mu0, sigma0^2) || N(0, prior_var * I))
     # = 0.5 * sum(sigma0^2/prior_var + mu0^2/prior_var - 1 + log(prior_var) - log(sigma0^2))
-    prior_var = 1.0 - 1.0 / mu.shape[1]  # 1 - 1/K
+    alpha = 0.02
+    K = mu.shape[1]
+    prior_mean = 0.0  # μ₁ₖ = log α − (1/K) Σ log α = 0 for symmetric α
+    prior_var = (1.0 / alpha) * (1.0 - 2.0 / K) + (1.0 / (K * K)) * (K / alpha)
+
     kl_loss = 0.5 * (
             log_var.exp() / prior_var
-            + mu.pow(2) / prior_var
+            + (mu - prior_mean).pow(2) / prior_var
             - 1
             + np.log(prior_var)
             - log_var

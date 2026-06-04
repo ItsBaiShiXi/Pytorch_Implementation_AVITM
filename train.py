@@ -52,7 +52,7 @@ def train(
     n_epochs=N_EPOCHS,
     warmup=WARMUP,
     device=DEVICE,
-    save_dir="checkpoints",
+    save_dir = f"checkpoints_k{N_TOPICS}"
 ):
     """
     Full training loop for AVITM.

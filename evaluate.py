@@ -15,7 +15,7 @@ from itertools import combinations
 
 from gibbs import CollapsedGibbsLDA
 
-
+N_TOPICS = 50
 # ── 1. Perplexity ──────────────────────────────────────────────────────────
 def compute_perplexity(model, data_loader, device):
     """
@@ -233,9 +233,9 @@ if __name__ == "__main__":
     vocab_size = len(vocab)
 
     # Load trained model
-    model = AVITM(vocab_size=vocab_size, n_topics=50).to(DEVICE)
+    model = AVITM(vocab_size=vocab_size, n_topics=N_TOPICS).to(DEVICE)
     model.load_state_dict(
-        torch.load("checkpoints/best_model.pt", map_location=DEVICE)
+        torch.load("checkpoints_k{N_TOPICS}/best_model.pt", map_location=DEVICE)
     )
     model.eval()
 
