@@ -13,6 +13,8 @@ import numpy as np
 import torch
 from itertools import combinations
 
+from gibbs import CollapsedGibbsLDA
+
 
 # ── 1. Perplexity ──────────────────────────────────────────────────────────
 def compute_perplexity(model, data_loader, device):
@@ -190,10 +192,37 @@ def print_topics(model, vocab, top_n=10, topic_npmis=None):
     print(f"{'='*60}\n")
 
 
+def evaluate_gibbs_lda(train_loader, test_loader, vocab, n_topics=50):
+    """Train and evaluate the collapsed Gibbs LDA baseline."""
+    print("\nTraining collapsed Gibbs LDA baseline...")
+
+    train_matrix = train_loader.dataset.data
+    test_matrix = test_loader.dataset.data
+
+    lda = CollapsedGibbsLDA(n_topics=n_topics, verbose=True)
+    lda.fit(train_matrix)
+
+    print("\nEvaluating collapsed Gibbs LDA baseline...")
+    train_ppl = lda.perplexity(train_matrix)
+    test_ppl = lda.perplexity(test_matrix)
+    avg_npmi, topic_npmis = compute_npmi(lda, train_loader, vocab, top_n=10, device="cpu")
+
+    print(f"  Train perplexity : {train_ppl:.1f}")
+    print(f"  Test  perplexity : {test_ppl:.1f}")
+    print(f"  Average NPMI     : {avg_npmi:.4f}")
+    print_topics(lda, vocab, top_n=10, topic_npmis=topic_npmis)
+
+    return {
+        "model": lda,
+        "train_perplexity": train_ppl,
+        "test_perplexity": test_ppl,
+        "avg_npmi": avg_npmi,
+        "topic_npmis": topic_npmis,
+    }
+
+
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import json
-    from pathlib import Path
     from data import get_dataloaders
     from model import AVITM
 
@@ -226,3 +255,17 @@ if __name__ == "__main__":
 
     # ── Print topics ──────────────────────────────────────────────────────
     print_topics(model, vocab, top_n=10, topic_npmis=topic_npmis)
+
+    # ── Collapsed Gibbs LDA baseline ─────────────────────────────────────
+    gibbs_results = evaluate_gibbs_lda(train_loader, test_loader, vocab, n_topics=50)
+
+    print("\n=== Comparison summary ===")
+    print(
+        f"AVITM: train ppl={train_ppl:.1f}, test ppl={test_ppl:.1f}, "
+        f"NPMI={avg_npmi:.4f}"
+    )
+    print(
+        f"Gibbs: train ppl={gibbs_results['train_perplexity']:.1f}, "
+        f"test ppl={gibbs_results['test_perplexity']:.1f}, "
+        f"NPMI={gibbs_results['avg_npmi']:.4f}"
+    )
