@@ -83,6 +83,9 @@ def get_dataloaders(
 
     print("Saving raw data locally...")
 
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+
     # Create dictionaries containing the text and their corresponding labels
     train_data_dict = {
         "text": train_raw.data,
@@ -97,13 +100,13 @@ def get_dataloaders(
     }
 
     # Write them to JSON files
-    with open("train_raw_data.json", "w", encoding="utf-8") as f:
-        json.dump(train_data_dict, f, indent=2) 
+    with open(data_dir / "train_raw_data.json", "w", encoding="utf-8") as f:
+        json.dump(train_data_dict, f, indent=2)
 
-    with open("test_raw_data.json", "w", encoding="utf-8") as f:
+    with open(data_dir / "test_raw_data.json", "w", encoding="utf-8") as f:
         json.dump(test_data_dict, f, indent=2)
 
-    print("  Saved to train_raw_data.json and test_raw_data.json")
+    print("  Saved to data/train_raw_data.json and data/test_raw_data.json")
     # END NEW CODE
 
     print(f"  Train docs : {len(train_raw.data)}")
@@ -130,9 +133,9 @@ def get_dataloaders(
     print(f"  Vocabulary size : {len(vocab)}")
     print(f"  Train matrix    : {train_bow.shape}")
     print(f"  Test matrix     : {test_bow.shape}")
-    vocab_path = Path("vocab.json")
-    with open(vocab_path, "w") as f:
-        json.dump(vocab.tolist(), f)
+    vocab_path = data_dir / "vocab.txt"
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(vocab.tolist()))
     print(f"  Vocab saved to {vocab_path}")
 
     # ── 3. Filter out empty documents ─────────────────────────────────────
@@ -168,10 +171,10 @@ def get_dataloaders(
 
     return train_loader, test_loader, vocab
 
-def load_vocab(path="vocab.json"):
+def load_vocab(path="data/vocab.txt"):
     """Load vocabulary from disk."""
-    with open(path, "r") as f:
-        vocab = json.load(f)
+    with open(path, "r", encoding="utf-8") as f:
+        vocab = [line.rstrip("\n") for line in f]
     return np.array(vocab)
 
 # ── Quick sanity check ─────────────────────────────────────────────────────

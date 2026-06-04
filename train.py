@@ -24,7 +24,7 @@ from model import AVITM, compute_loss
 N_TOPICS    = 50
 HIDDEN_SIZE = 100
 DROPOUT     = 0.2
-LR          = 1e-3
+LR          = 2e-3
 N_EPOCHS    = 100
 WARMUP      = 20       # epochs to anneal KL from 0 to 1
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,7 +91,7 @@ def train(
         dropout=dropout,
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.99, 0.999))
 
     # ── History ───────────────────────────────────────────────────────────
     history = {

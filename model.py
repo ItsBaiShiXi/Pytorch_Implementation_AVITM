@@ -16,7 +16,7 @@ Loss (ELBO):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
 
 class Encoder(nn.Module):
     """
@@ -30,22 +30,22 @@ class Encoder(nn.Module):
     def __init__(self, vocab_size, n_topics, hidden_size=100, dropout=0.2):
         super().__init__()
 
-        self.fc1      = nn.Linear(vocab_size, hidden_size)
-        self.fc2      = nn.Linear(hidden_size, hidden_size)
-        self.fc_mu    = nn.Linear(hidden_size, n_topics)
-        self.fc_logvar = nn.Linear(hidden_size, n_topics)
+        self.fc1      = nn.Linear(vocab_size, hidden_size)  #(200,2000) * (2000,100) = (200,100)
+        self.fc2      = nn.Linear(hidden_size, hidden_size) #(200,100) * (100,100) = (200,100)
+        self.fc_mu    = nn.Linear(hidden_size, n_topics)    #(200,100) * (100,50) = (200,50)
+        self.fc_logvar = nn.Linear(hidden_size, n_topics)   #(200,100) * (100,50) = (200,50)
 
-        self.activation = nn.Softplus()
-        self.dropout    = nn.Dropout(dropout)
+        self.activation = nn.Softplus()                     #(200,100) -> (200,100)
+        self.dropout    = nn.Dropout(dropout)               #(200,100) -> (200,100)
 
         # Batch norm on hidden layers — helps prevent component collapsing
-        self.bn1 = nn.BatchNorm1d(hidden_size)
-        self.bn2 = nn.BatchNorm1d(hidden_size)
+        self.bn1 = nn.BatchNorm1d(hidden_size)  #(200,100) -> (200,100)
+        self.bn2 = nn.BatchNorm1d(hidden_size)  #(200,100) -> (200,100)
 
     def forward(self, x):
         # Normalize BOW to word frequencies (sum to 1 per document)
         # This makes the encoder input scale-invariant across doc lengths
-        x = x / (x.sum(dim=1, keepdim=True) + 1e-8)
+        x = x / (x.sum(dim=1, keepdim=True) + 1e-8) #(200, 2000)
 
         h = self.dropout(self.activation(self.bn1(self.fc1(x))))
         h = self.dropout(self.activation(self.bn2(self.fc2(h))))
@@ -116,6 +116,11 @@ class AVITM(nn.Module):
         self.prior_mean    = torch.zeros(n_topics)
         self.prior_log_var = torch.zeros(n_topics)
 
+        # Laplace approximation prior parameters (Equation 6, alpha=1)
+        # mu1 = 0 (all zeros when alpha=1)
+        # var1 = 1 - 1/K per dimension
+        self.prior_var = 1.0 - 1.0 / n_topics  # scalar, same for all dims
+
     def reparameterize(self, mu, log_var):
         """
         Reparameterization trick: z = mu + eps * sigma, eps ~ N(0, I)
@@ -152,6 +157,7 @@ class AVITM(nn.Module):
         # Convert to topic proportions via softmax
         # This is the Laplace approximation: softmax(Gaussian) ≈ Dirichlet
         theta = F.softmax(z, dim=1)
+        theta = F.dropout(theta, p=0.2, training=self.training)
 
         # Decode
         recon = self.decoder(theta)
@@ -216,8 +222,16 @@ def compute_loss(recon, x, mu, log_var):
     # x acts as weights — words that appear more contribute more to the loss
     recon_loss = -(x * recon).sum(dim=1).mean()
 
-    # KL divergence: closed-form under Gaussian approximation
-    kl_loss = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp()).sum(dim=1).mean()
+    # Full KL: KL(N(mu0, sigma0^2) || N(0, prior_var * I))
+    # = 0.5 * sum(sigma0^2/prior_var + mu0^2/prior_var - 1 + log(prior_var) - log(sigma0^2))
+    prior_var = 1.0 - 1.0 / mu.shape[1]  # 1 - 1/K
+    kl_loss = 0.5 * (
+            log_var.exp() / prior_var
+            + mu.pow(2) / prior_var
+            - 1
+            + np.log(prior_var)
+            - log_var
+    ).sum(dim=1).mean()
 
     loss = recon_loss + kl_loss
 
