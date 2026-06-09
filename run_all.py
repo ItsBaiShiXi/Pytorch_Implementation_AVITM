@@ -17,6 +17,7 @@ import torch
 import torch.optim as optim
 import numpy as np
 import json
+import time
 from pathlib import Path
 from scipy.sparse import csr_matrix
 from sklearn.decomposition import LatentDirichletAllocation
@@ -28,7 +29,7 @@ from gibbs import CollapsedGibbsLDA
 
 
 # ── Hyperparameters ────────────────────────────────────────────────────────
-N_TOPICS     = 200
+N_TOPICS     = 50
 HIDDEN_SIZE  = 100
 DROPOUT      = 0.2
 LR           = 2e-3
@@ -95,7 +96,7 @@ def train_avitm(train_loader, test_loader, vocab_size, model_type,
         vocab_size=vocab_size,
         n_topics=n_topics,
         hidden_size=HIDDEN_SIZE,
-        dropout=DROPOUT,
+        dropout_rate=DROPOUT,
         model_type=model_type,
     ).to(DEVICE)
 
@@ -111,7 +112,7 @@ def train_avitm(train_loader, test_loader, vocab_size, model_type,
             batch = batch.to(DEVICE)
             optimizer.zero_grad()
             recon, mu, log_var = model(batch)
-            loss, recon_loss, kl_loss = compute_loss(recon, batch, mu, log_var)
+            loss, recon_loss, kl_loss = compute_loss(recon, batch, mu, log_var, model.prior_mean, model.prior_log_var)
             annealed_loss = recon_loss + kl_weight * kl_loss
             annealed_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -124,7 +125,7 @@ def train_avitm(train_loader, test_loader, vocab_size, model_type,
             for batch in test_loader:
                 batch = batch.to(DEVICE)
                 recon, mu, log_var = model(batch)
-                loss, _, _ = compute_loss(recon, batch, mu, log_var)
+                loss, _, _ = compute_loss(recon, batch, mu, log_var, model.prior_mean, model.prior_log_var)
                 test_loss += loss.item()
         test_loss /= len(test_loader)
 
@@ -143,17 +144,33 @@ def train_avitm(train_loader, test_loader, vocab_size, model_type,
 
 
 def eval_avitm_perplexity(model, data_loader):
-    """Compute perplexity for AVITM using log-likelihood method."""
+    """Compute perplexity for AVITM using the full ELBO."""
     model.eval()
-    total_log_likelihood = 0.0
-    total_word_count     = 0.0
+    total_elbo = 0.0
+    total_word_count = 0.0
     with torch.no_grad():
         for batch in data_loader:
             batch = batch.to(DEVICE)
             recon, mu, log_var = model(batch)
-            total_log_likelihood += (batch * recon).sum().item()
-            total_word_count     += batch.sum().item()
-    return float(np.exp(-total_log_likelihood / total_word_count))
+
+            # Use the full compute_loss function to get the ELBO
+            # (loss is the negative ELBO)
+            loss, _, _ = compute_loss(
+                recon,
+                batch,
+                mu,
+                log_var,
+                model.prior_mean,
+                model.prior_log_var
+            )
+
+            # We multiply by the batch size because your compute_loss
+            # takes the .mean() across the batch, but we need the raw sum
+            total_elbo += (loss.item() * batch.shape[0])
+            total_word_count += batch.sum().item()
+
+    # Perplexity = exp( Total Negative ELBO / Total Words )
+    return float(np.exp(total_elbo / total_word_count))
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -178,9 +195,76 @@ def main():
 
     all_results = {}
 
-    # ── 1. LDA-DMFVI (sklearn online VI) ──────────────────────────────────
+    # ── 1. AVITM ProdLDA ──────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  1. LDA-DMFVI (sklearn online variational inference)")
+    print("  1. AVITM ProdLDA (product-of-experts decoder)")
+    print("=" * 60)
+    start_time = time.perf_counter()
+    avitm_prod = train_avitm(
+        train_loader, test_loader, vocab_size,
+        model_type='prodLDA',
+        save_path=save_dir / "avitm_prodlda_best.pt",
+    )
+    elapsed_time = time.perf_counter() - start_time
+
+    avitm_prod_train_ppl = eval_avitm_perplexity(avitm_prod, train_loader)
+    avitm_prod_test_ppl = eval_avitm_perplexity(avitm_prod, test_loader)
+    avitm_prod_words = avitm_prod.get_topics(vocab, top_n=10)
+    avitm_prod_avg_npmi, avitm_prod_topic_npmis = npmi_from_topics(
+        avitm_prod_words, all_docs, word_counts, vocab
+    )
+
+    print(f"  Train perplexity : {avitm_prod_train_ppl:.1f}")
+    print(f"  Test  perplexity : {avitm_prod_test_ppl:.1f}")
+    print(f"  Avg NPMI         : {avitm_prod_avg_npmi:.4f}")
+    print(f"  Training Time    : {elapsed_time:.1f} s")
+
+    all_results["AVITM-ProdLDA"] = {
+        "train_ppl": avitm_prod_train_ppl,
+        "test_ppl": avitm_prod_test_ppl,
+        "avg_npmi": avitm_prod_avg_npmi,
+        "topic_npmis": avitm_prod_topic_npmis,
+        "topic_words": avitm_prod_words,
+        "time_seconds": elapsed_time
+    }
+
+    # ── 2. AVITM LDA-VAE ──────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  2. AVITM LDA-VAE (mixture model decoder)")
+    print("=" * 60)
+
+    start_time = time.perf_counter()
+    avitm_lda = train_avitm(
+        train_loader, test_loader, vocab_size,
+        model_type='LDA',
+        save_path=save_dir / "avitm_lda_best.pt",
+    )
+    elapsed_time = time.perf_counter() - start_time
+
+    avitm_lda_train_ppl = eval_avitm_perplexity(avitm_lda, train_loader)
+    avitm_lda_test_ppl = eval_avitm_perplexity(avitm_lda, test_loader)
+    avitm_lda_words = avitm_lda.get_topics(vocab, top_n=10)
+    avitm_lda_avg_npmi, avitm_lda_topic_npmis = npmi_from_topics(
+        avitm_lda_words, all_docs, word_counts, vocab
+    )
+
+    print(f"  Train perplexity : {avitm_lda_train_ppl:.1f}")
+    print(f"  Test  perplexity : {avitm_lda_test_ppl:.1f}")
+    print(f"  Avg NPMI         : {avitm_lda_avg_npmi:.4f}")
+    print(f"  Training Time    : {elapsed_time:.1f} s")
+
+    all_results["AVITM-LDA"] = {
+        "train_ppl": avitm_lda_train_ppl,
+        "test_ppl": avitm_lda_test_ppl,
+        "avg_npmi": avitm_lda_avg_npmi,
+        "topic_npmis": avitm_lda_topic_npmis,
+        "topic_words": avitm_lda_words,
+        "time_seconds": elapsed_time
+    }
+
+    # ── 3. LDA-DMFVI (sklearn online VI) ──────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  3. LDA-DMFVI (sklearn online variational inference)")
     print("=" * 60)
     lda_dmfvi = LatentDirichletAllocation(
         n_components=N_TOPICS,
@@ -191,7 +275,9 @@ def main():
         learning_offset=50.0,
         learning_decay=0.7,
     )
+    start_time = time.perf_counter()
     lda_dmfvi.fit(csr_matrix(X_train))
+    elapsed_time = time.perf_counter() - start_time
 
     # Perplexity via log-likelihood (consistent with AVITM)
     dmfvi_train_ppl = float(np.exp(
@@ -214,6 +300,7 @@ def main():
     print(f"  Train perplexity : {dmfvi_train_ppl:.1f}")
     print(f"  Test  perplexity : {dmfvi_test_ppl:.1f}")
     print(f"  Avg NPMI         : {dmfvi_avg_npmi:.4f}")
+    print(f"  Training Time    : {elapsed_time:.1f} s")
 
     all_results["LDA-DMFVI"] = {
         "train_ppl"   : dmfvi_train_ppl,
@@ -221,11 +308,12 @@ def main():
         "avg_npmi"    : dmfvi_avg_npmi,
         "topic_npmis" : dmfvi_topic_npmis,
         "topic_words" : dmfvi_topic_words,
+        "time_seconds": elapsed_time
     }
 
-    # ── 2. Collapsed Gibbs LDA ─────────────────────────────────────────────
+    # ── 4. Collapsed Gibbs LDA ─────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  2. Collapsed Gibbs LDA")
+    print("  4. Collapsed Gibbs LDA")
     print("=" * 60)
     gibbs = CollapsedGibbsLDA(
         n_topics=N_TOPICS,
@@ -233,7 +321,9 @@ def main():
         random_state=RANDOM_STATE,
         verbose=True,
     )
+    start_time = time.perf_counter()
     gibbs.fit(X_train)
+    elapsed_time = time.perf_counter() - start_time
 
     gibbs_train_ppl = gibbs.perplexity(X_train)
     gibbs_test_ppl  = gibbs.perplexity(X_test)
@@ -245,6 +335,7 @@ def main():
     print(f"  Train perplexity : {gibbs_train_ppl:.1f}")
     print(f"  Test  perplexity : {gibbs_test_ppl:.1f}")
     print(f"  Avg NPMI         : {gibbs_avg_npmi:.4f}")
+    print(f"  Training Time    : {elapsed_time:.1f} s")
 
     all_results["Gibbs-LDA"] = {
         "train_ppl"   : float(gibbs_train_ppl),
@@ -252,65 +343,12 @@ def main():
         "avg_npmi"    : gibbs_avg_npmi,
         "topic_npmis" : gibbs_topic_npmis,
         "topic_words" : gibbs_topic_words,
+        "time_seconds": elapsed_time
     }
 
-    # ── 3. AVITM LDA-VAE ──────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  3. AVITM LDA-VAE (mixture model decoder)")
-    print("=" * 60)
-    avitm_lda = train_avitm(
-        train_loader, test_loader, vocab_size,
-        model_type='LDA',
-        save_path=save_dir / "avitm_lda_best.pt",
-    )
 
-    avitm_lda_train_ppl = eval_avitm_perplexity(avitm_lda, train_loader)
-    avitm_lda_test_ppl  = eval_avitm_perplexity(avitm_lda, test_loader)
-    avitm_lda_words     = avitm_lda.get_topics(vocab, top_n=10)
-    avitm_lda_avg_npmi, avitm_lda_topic_npmis = npmi_from_topics(
-        avitm_lda_words, all_docs, word_counts, vocab
-    )
 
-    print(f"  Train perplexity : {avitm_lda_train_ppl:.1f}")
-    print(f"  Test  perplexity : {avitm_lda_test_ppl:.1f}")
-    print(f"  Avg NPMI         : {avitm_lda_avg_npmi:.4f}")
 
-    all_results["AVITM-LDA"] = {
-        "train_ppl"   : avitm_lda_train_ppl,
-        "test_ppl"    : avitm_lda_test_ppl,
-        "avg_npmi"    : avitm_lda_avg_npmi,
-        "topic_npmis" : avitm_lda_topic_npmis,
-        "topic_words" : avitm_lda_words,
-    }
-
-    # ── 4. AVITM ProdLDA ──────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  4. AVITM ProdLDA (product-of-experts decoder)")
-    print("=" * 60)
-    avitm_prod = train_avitm(
-        train_loader, test_loader, vocab_size,
-        model_type='prodLDA',
-        save_path=save_dir / "avitm_prodlda_best.pt",
-    )
-
-    avitm_prod_train_ppl = eval_avitm_perplexity(avitm_prod, train_loader)
-    avitm_prod_test_ppl  = eval_avitm_perplexity(avitm_prod, test_loader)
-    avitm_prod_words     = avitm_prod.get_topics(vocab, top_n=10)
-    avitm_prod_avg_npmi, avitm_prod_topic_npmis = npmi_from_topics(
-        avitm_prod_words, all_docs, word_counts, vocab
-    )
-
-    print(f"  Train perplexity : {avitm_prod_train_ppl:.1f}")
-    print(f"  Test  perplexity : {avitm_prod_test_ppl:.1f}")
-    print(f"  Avg NPMI         : {avitm_prod_avg_npmi:.4f}")
-
-    all_results["AVITM-ProdLDA"] = {
-        "train_ppl"   : avitm_prod_train_ppl,
-        "test_ppl"    : avitm_prod_test_ppl,
-        "avg_npmi"    : avitm_prod_avg_npmi,
-        "topic_npmis" : avitm_prod_topic_npmis,
-        "topic_words" : avitm_prod_words,
-    }
 
     # ── Save all results ───────────────────────────────────────────────────
     results_path = save_dir / "all_results.json"
@@ -319,17 +357,17 @@ def main():
     print(f"\nAll results saved to {results_path}")
 
     # ── Print comparison table ─────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print(f"  {'Model':<20} {'Test PPL':>10} {'Avg NPMI':>10}")
-    print("=" * 60)
+    print("\n" + "=" * 75)
+    print(f"  {'Model':<20} {'Test PPL':>10} {'Avg NPMI':>10} {'Time (s)':>10}")
+    print("=" * 75)
     for name, res in all_results.items():
-        print(f"  {name:<20} {res['test_ppl']:>10.1f} {res['avg_npmi']:>10.4f}")
-    print("-" * 60)
-    print(f"  {'Paper LDA-DMFVI':<20} {'1046':>10} {'0.11':>10}")
-    print(f"  {'Paper LDA-VAE':<20} {'1059':>10} {'0.11':>10}")
-    print(f"  {'Paper ProdLDA-VAE':<20} {'1172':>10} {'0.24':>10}")
-    print(f"  {'Paper Gibbs':<20} {'728':>10} {'0.17':>10}")
-    print("=" * 60)
+        print(f"  {name:<20} {res['test_ppl']:>10.1f} {res['avg_npmi']:>10.4f} {res['time_seconds']:>10.1f}")
+    print("-" * 75)
+    print(f"  {'Paper ProdLDA-VAE':<20} {'1172':>10} {'0.24':>10} {'-':>10}")
+    print(f"  {'Paper LDA-VAE':<20} {'1059':>10} {'0.11':>10} {'-':>10}")
+    print(f"  {'Paper LDA-DMFVI':<20} {'1046':>10} {'0.11':>10} {'-':>10}")
+    print(f"  {'Paper Gibbs':<20} {'728':>10} {'0.17':>10} {'-':>10}")
+    print("=" * 75)
 
     return all_results
 

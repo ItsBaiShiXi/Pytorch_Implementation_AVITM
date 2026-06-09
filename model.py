@@ -12,7 +12,7 @@ Loss (ELBO):
     reconstruction loss : multinomial log-likelihood
     KL loss             : KL(q(z|x) || p(z)) under Laplace approximation
 """
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +27,7 @@ class Encoder(nn.Module):
              log_var   (batch_size, n_topics)     — posterior log variance
     """
 
-    def __init__(self, vocab_size, n_topics, hidden_size=100, dropout=0.2):
+    def __init__(self, vocab_size, n_topics, hidden_size=100):
         super().__init__()
 
         self.fc1      = nn.Linear(vocab_size, hidden_size)  #(200,2000) * (2000,100) = (200,100)
@@ -36,22 +36,20 @@ class Encoder(nn.Module):
         self.fc_logvar = nn.Linear(hidden_size, n_topics)   #(200,100) * (100,50) = (200,50)
 
         self.activation = nn.Softplus()                     #(200,100) -> (200,100)
-        self.dropout    = nn.Dropout(dropout)               #(200,100) -> (200,100)
 
         # Batch norm on hidden layers — helps prevent component collapsing
-        self.bn1 = nn.BatchNorm1d(hidden_size)  #(200,100) -> (200,100)
-        self.bn2 = nn.BatchNorm1d(hidden_size)  #(200,100) -> (200,100)
+        self.bn_logvar = nn.BatchNorm1d(n_topics)  #(200,100) -> (200,100)
 
     def forward(self, x):
-        # Normalize BOW to word frequencies (sum to 1 per document)
-        # This makes the encoder input scale-invariant across doc lengths
-        x = x / (x.sum(dim=1, keepdim=True) + 1e-8) #(200, 2000)
+        # 1. Pass through shared hidden layers with Softplus
+        h = self.activation(self.fc1(x))
+        h = self.activation(self.fc2(h))
 
-        h = self.dropout(self.activation(self.bn1(self.fc1(x))))
-        h = self.dropout(self.activation(self.bn2(self.fc2(h))))
+        # 2. Calculate Mean
+        mu = self.fc_mu(h)
 
-        mu      = self.fc_mu(h)
-        log_var = self.fc_logvar(h)
+        # 3. Calculate Variance and apply Batch Normalization
+        log_var = self.bn_logvar(self.fc_logvar(h))
 
         return mu, log_var
 
@@ -69,14 +67,15 @@ class Decoder(nn.Module):
         self.model_type = model_type
         # Beta matrix: each row is a topic's word distribution
         # No bias — keeps the interpretation clean (pure topic-word weights)
-        self.fc      = nn.Linear(n_topics, vocab_size, bias=False)
+        self.fc      = nn.Linear(n_topics, vocab_size, bias=False)  # beta matrix
         self.bn      = nn.BatchNorm1d(vocab_size)
 
     def forward(self, theta):
         if self.model_type == 'LDA':
             # Normalize beta per topic first, then mix
             beta  = F.softmax(self.fc.weight, dim=0)  # (vocab_size, n_topics)
-            recon = F.log_softmax(self.bn(theta @ beta.T), dim=1)
+            word_probs = theta @ beta.T
+            recon = torch.log(word_probs + 1e-8)
         else:
             # ProdLDA: mix in logit space, softmax after
             recon = F.log_softmax(self.bn(self.fc(theta)), dim=1)
@@ -106,26 +105,40 @@ class AVITM(nn.Module):
         vocab_size,
         n_topics=50,
         hidden_size=100,
-        dropout=0.2,
-        model_type="prodLDA"
+        dropout_rate=0.2,
+        model_type="prodLDA",
+        alpha = None
     ):
         super().__init__()
 
         self.n_topics   = n_topics
         self.vocab_size = vocab_size
 
-        self.encoder = Encoder(vocab_size, n_topics, hidden_size, dropout)
+        self.encoder = Encoder(vocab_size, n_topics, hidden_size)
         self.decoder = Decoder(n_topics, vocab_size, model_type)
+        self.dropout_rate = dropout_rate
+        # If no alpha is provided, default to 1/K
+        if alpha is None:
+            alpha = 1.0 / n_topics
+        # # Prior: N(0, I) in the Laplace approximation space
+        # # (approximates a symmetric Dirichlet prior)
+        # self.prior_mean    = torch.zeros(n_topics)
+        # self.prior_log_var = torch.zeros(n_topics)
+        #
+        # # Laplace approximation prior parameters (Equation 6, alpha=1)
+        # # mu1 = 0 (all zeros when alpha=1)
+        # # var1 = 1 - 1/K per dimension
+        # self.prior_var = 1.0 - 1.0 / n_topics  # scalar, same for all dims
 
-        # Prior: N(0, I) in the Laplace approximation space
-        # (approximates a symmetric Dirichlet prior)
-        self.prior_mean    = torch.zeros(n_topics)
-        self.prior_log_var = torch.zeros(n_topics)
+        # Laplace approximation prior parameters (Equation 6)
+        # For a symmetric Dirichlet prior, mu is always 0.
+        self.register_buffer('prior_mean', torch.zeros(1))
 
-        # Laplace approximation prior parameters (Equation 6, alpha=1)
-        # mu1 = 0 (all zeros when alpha=1)
-        # var1 = 1 - 1/K per dimension
-        self.prior_var = 1.0 - 1.0 / n_topics  # scalar, same for all dims
+        # Variance formula: (1/alpha) * (1 - 1/K)
+        prior_var = (1.0 / alpha) * (1.0 - (1.0 / n_topics))
+
+        # We store the log variance to match the ELBO calculation later
+        self.register_buffer('prior_log_var', torch.full((1,), math.log(prior_var)))
 
     def reparameterize(self, mu, log_var):
         """
@@ -163,7 +176,7 @@ class AVITM(nn.Module):
         # Convert to topic proportions via softmax
         # This is the Laplace approximation: softmax(Gaussian) ≈ Dirichlet
         theta = F.softmax(z, dim=1)
-        theta = F.dropout(theta, p=0.2, training=self.training)
+        theta = F.dropout(theta, p=self.dropout_rate, training=self.training)
 
         # Decode
         recon = self.decoder(theta)
@@ -198,7 +211,7 @@ class AVITM(nn.Module):
         return topics
 
 
-def compute_loss(recon, x, mu, log_var):
+def compute_loss(recon, x, mu, log_var, prior_mean, prior_log_var):
     """
     ELBO loss = reconstruction loss + KL divergence.
 
@@ -230,16 +243,15 @@ def compute_loss(recon, x, mu, log_var):
 
     # Full KL: KL(N(mu0, sigma0^2) || N(0, prior_var * I))
     # = 0.5 * sum(sigma0^2/prior_var + mu0^2/prior_var - 1 + log(prior_var) - log(sigma0^2))
-    alpha = 0.02
-    K = mu.shape[1]
-    prior_mean = 0.0  # μ₁ₖ = log α − (1/K) Σ log α = 0 for symmetric α
-    prior_var = (1.0 / alpha) * (1.0 - 2.0 / K) + (1.0 / (K * K)) * (K / alpha)
+    # We use the pre-calculated prior_log_var from the model buffers
+    # instead of recalculating Equation 6 on the fly.
+    prior_var = prior_log_var.exp()
 
     kl_loss = 0.5 * (
             log_var.exp() / prior_var
             + (mu - prior_mean).pow(2) / prior_var
             - 1
-            + np.log(prior_var)
+            + prior_log_var
             - log_var
     ).sum(dim=1).mean()
 
@@ -271,7 +283,14 @@ if __name__ == "__main__":
     print(f"  log_var : {log_var.shape}")  # (200, 50)
 
     # Loss
-    loss, recon_loss, kl_loss = compute_loss(recon, x, mu, log_var)
+    loss, recon_loss, kl_loss = compute_loss(
+        recon,
+        x,
+        mu,
+        log_var,
+        model.prior_mean,
+        model.prior_log_var
+    )
     print(f"\nLoss:")
     print(f"  Total : {loss.item():.4f}")
     print(f"  Recon : {recon_loss.item():.4f}")
